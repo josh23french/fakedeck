@@ -1,3 +1,6 @@
+github.com/adrg/libvlc-go v0.0.1 h1:4bh+vz1XQ+mglpKzSWryhOhmyN85HrzWxzGoGfbbldU=
+github.com/adrg/libvlc-go/v3 v3.0.6 h1:uRjdmHCV64T1o5XF3ZHOcvBOqEiJP5MoqmUgW/Ojvtw=
+github.com/adrg/libvlc-go/v3 v3.0.6/go.mod h1:xJK0YD8cyMDejnrTFQinStE6RYCV1nlfS8KmqTpszSc=
 github.com/davecgh/go-spew v1.1.0 h1:ZDRjVQ15GmhC3fiQ8ni8+OwkZQO4DARzQgrnXU1Liz8=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

@@ -1,6 +1,14 @@
 package protocol
 
-import "strings"
+import (
+	"strings"
+)
+
+// Failure Response Codes
+const (
+	ErrorInvalidValue = "102 invalid value"
+	ErrorUnsupported  = "103 unsupported"
+)
 
 // Command represents a command
 type Command struct {
@@ -8,36 +16,30 @@ type Command struct {
 	Parameters map[string]string
 }
 
-// FromString creates a command from a string... just like it says
-func FromString(cmd string) *Command {
+// CommandFromString creates a command from a string... just like it says
+func CommandFromString(cmd string) *Command {
 	parts := strings.SplitN(cmd, ":", 2)
-	// "play: speed: 200"
-
 	name := parts[0]
 	params := make(map[string]string)
 
 	if len(parts) == 2 {
-		// parts[1] = " speed: 200 param2: val"
-		// parts[1][1:] = "speed: 200 param2: val"
-		paramParts := strings.SplitN(parts[1][1:], " ", 30)
+		remainder := parts[1][1:]
 		for {
-			if len(paramParts) == 0 {
-				// end of params
+			splitAtColon := strings.SplitN(remainder, ":", 2)
+			if len(splitAtColon) == 1 {
+				// No colon... stop parsing params
 				break
 			}
-			if len(paramParts) < 2 {
-				// invalid param... no value?
-				break
-			}
-			key := paramParts[0]
-			val := paramParts[1]
-			if !strings.HasSuffix(key, ":") {
-				// invalid key
-				break
-			}
-			key = strings.TrimSuffix(key, ":")
+			key := splitAtColon[0]
+			splitAtSpace := strings.SplitN(splitAtColon[1][1:], " ", 2)
+
+			val := splitAtSpace[0]
 			params[key] = val
-			paramParts = paramParts[2:]
+
+			remainder = ""
+			if len(splitAtSpace) == 2 {
+				remainder = splitAtSpace[1]
+			}
 		}
 	}
 
