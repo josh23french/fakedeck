@@ -1,8 +1,10 @@
 package deck
 
 import (
-	"errors"
 	"fmt"
+	"strconv"
+
+	"github.com/josh23french/fakedeck/pkg/protocol"
 )
 
 // NotifyFlags keep the state of what updates should send/receive async messages
@@ -16,6 +18,7 @@ type NotifyFlags struct {
 	TimelinePosition bool
 	PlayRange        bool
 	DynamicRange     bool
+	Cache            bool
 }
 
 // Video Formats, prefixed with VideoFormat because apparently starting a const with a number is illegal now... :(
@@ -119,135 +122,37 @@ type Transport struct {
 	Loop            bool
 }
 
+// Marshall turns the Transport into a slice of strings
+func (t *Transport) Marshall() []string {
+	lines := make([]string, 0)
+	lines = append(lines, fmt.Sprintf("status: %v", t.Status))
+	lines = append(lines, fmt.Sprintf("speed: %v", t.Speed))
+
+	slot := "none"
+	if t.SlotID > 0 {
+		slot = strconv.FormatInt(int64(t.SlotID), 10)
+	}
+	lines = append(lines, fmt.Sprintf("slot id: %v", slot))
+
+	clip := "1"
+	if t.ClipID > 0 {
+		clip = strconv.FormatInt(int64(t.ClipID), 10)
+	}
+	lines = append(lines, fmt.Sprintf("clip id: %v", clip))
+
+	lines = append(lines, fmt.Sprintf("display timecode: %v", t.DisplayTimecode))
+	lines = append(lines, fmt.Sprintf("timecode: %v", t.Timecode))
+	lines = append(lines, fmt.Sprintf("video format: %v", t.VideoFormat))
+	lines = append(lines, fmt.Sprintf("loop: %v", t.Loop))
+	return lines
+}
+
 // Deck represents the deck state
-type Deck struct {
-	server    Server
-	Model     string
-	NumSlots  int
-	Slots     []Slot
-	Transport Transport
-	Notify    NotifyFlags
-	Remote    RemoteFlags
-	Clips     []Clip
-}
-
-// NewDeck creates a new Deck
-func NewDeck(model string, numSlots int) *Deck {
-	slots := make([]Slot, 0)
-	for i := 1; i <= numSlots; i++ {
-		slots = append(slots, Slot{
-			ID:            i,
-			Status:        "empty",
-			VolumeName:    "",
-			RecordingTime: 0,
-			VideoFormat:   VideoFormat720p5994, // Should be loaded from some saved state mimicing the Deck's NVRAM?
-			Clips:         make([]Clip, 0),
-		})
-	}
-	deck := &Deck{
-		server:   Server{}, // uninitialized now, but will be before end of constructor
-		Model:    model,
-		NumSlots: numSlots,
-		Slots:    slots,
-		Transport: Transport{
-			SlotID:      0,
-			Speed:       0,
-			ClipID:      0,
-			VideoFormat: VideoFormat720p5994,
-			Loop:        false,
-		},
-		Notify: NotifyFlags{ // All notifications are off by default
-			Transport:        false,
-			Slot:             false,
-			Remote:           false,
-			Configuration:    false,
-			DroppedFrames:    false,
-			DisplayTimecode:  false,
-			TimelinePosition: false,
-			PlayRange:        false,
-			DynamicRange:     false,
-		},
-		Remote: RemoteFlags{
-			Enabled:  true, // Ours will default to true because there's otherwise no point to building this...
-			Override: false,
-		},
-		Clips: make([]Clip, 0),
-	}
-	deck.server = *NewServer(deck)
-	return deck
-}
-
-// PowerOn starts up the deck, including the server
-func (d *Deck) PowerOn() {
-	fmt.Printf("Booting FakeDeck Model \"%v\" with %v slots...\n", d.Model, d.NumSlots)
-	d.server.Serve()
-}
-
-// PowerOff shuts everything down that we own
-func (d *Deck) PowerOff() {
-	d.server.Close()
-}
-
-func (d *Deck) slotOccupied(slot int) (bool, error) {
-	for _, s := range d.Slots {
-		if s.ID == slot {
-			switch s.Status {
-			case "empty":
-				return false, nil
-			case "error":
-			case "mounting":
-			case "mounted":
-			default:
-				return true, nil
-			}
-		}
-	}
-	return false, errors.New("slot doesn't exist") // Could also mean the slot doesn't exist
-}
-
-// SelectedSlot returns the currently-active slot of the Deck
-func (d *Deck) SelectedSlot() int {
-	return d.Transport.SlotID
-}
-
-// SelectSlot makes the slot active and loads the clips
-func (d *Deck) SelectSlot(slot int) error {
-	for _, s := range d.Slots {
-		if s.ID == slot {
-			fmt.Printf("Loading slot %+v\n", s)
-			d.Clips = s.Clips // Load the clips!
-			// TODO: only load clips of the currently-active video format?
-			d.Transport.SlotID = s.ID
-			return nil
-		}
-	}
-	return errors.New("slot went away?")
-}
-
-// InsertDrive does what it says on the tin
-func (d *Deck) InsertDrive(slot int, drive Drive) error {
-	occ, err := d.slotOccupied(slot)
-	if err != nil {
-		return err
-	}
-	if occ {
-		return errors.New("slot doesn't exist or is occupied")
-	}
-	// Insert the drive
-	for i := range d.Slots {
-		if d.Slots[i].ID == slot {
-			d.Slots[i].Status = "mounting"
-			d.Slots[i].VolumeName = drive.VolumeName
-			d.Slots[i].Clips = drive.Clips
-			d.Slots[i].Status = "mounted"
-
-			// When inserting a drive, and we don't have one selected, select the newly-inserted one automatically
-			if d.SelectedSlot() == 0 {
-				return d.SelectSlot(d.Slots[i].ID)
-			}
-
-			return nil
-		}
-	}
-	return errors.New("slot went away?")
+type Deck interface {
+	GetModel() string                        // returns the model of the deck
+	GetProtocol() string                     // returns the protocol version supported
+	ProcessCommand(*protocol.Command) string // returns a response to the command
+	PowerOn()                                // start the server and output
+	PowerOff()                               // clean up server and output
+	// ClientConnected()                        // resets the per-client settings when the client connects
 }

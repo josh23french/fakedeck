@@ -4,33 +4,45 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/rs/zerolog/log"
+
+	vlc "github.com/adrg/libvlc-go/v3"
 	"github.com/josh23french/fakedeck/pkg/protocol"
 )
 
 // Server represents a FakeDeck server, responding to clients and updating its state
 type Server struct {
-	deck     *Deck
+	deck     Deck
+	player   *vlc.Player
 	clientIP string // We can only ever serve a single client; this is where we keep track of who it is
-	quit     chan interface{}
+	conn     net.Conn
+	sync.RWMutex
+	quit chan interface{}
 }
 
 // NewServer constructs a new Server... duh
-func NewServer(d *Deck) *Server {
+func NewServer(d Deck) *Server {
 	return &Server{
 		deck:     d,
 		clientIP: "",
+		conn:     nil,
 		quit:     make(chan interface{}),
 	}
 }
 
+func (s *Server) SetPlayer(player *vlc.Player) {
+	s.player = player
+}
+
 // Close stops the server
 func (s *Server) Close() {
-	fmt.Println("Closing the server...")
+	log.Info().Msg("closing the server...")
 	s.quit <- 1
 }
 
@@ -39,18 +51,24 @@ func (s *Server) Serve() {
 	go func() {
 		l, err := net.Listen("tcp", ":9993")
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal().Err(err).Msg("could not start server")
 		}
-		defer l.Close()
 		go func() {
 			<-s.quit
-			l.Close()
+			err := l.Close()
+			if err != nil {
+				log.Fatal().Err(err).Msg("error closing listener")
+			}
 		}()
 		for {
 			// Wait for a connection.
 			conn, err := l.Accept()
 			if err != nil {
-				fmt.Printf("%v", fmt.Errorf("Error accepting connection: %w", err))
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					log.Info().Msg("connection closing...")
+					return
+				}
+				log.Warn().Err(err).Msg("error accepting connection")
 				continue
 			}
 			// Handle the connection in a new goroutine.
@@ -59,132 +77,127 @@ func (s *Server) Serve() {
 			go func(c net.Conn) {
 				clientIP := strings.SplitN(c.RemoteAddr().String(), ":", 2)[0]
 				if s.clientIP != "" && clientIP != s.clientIP {
-					fmt.Printf("ClientIP isn't the one we are supposed to be talking to... closing.\n")
-					c.Write([]byte("120 connection rejected\r\n"))
+					log.Info().Msg("ClientIP isn't the one we are supposed to be talking to... closing.")
+					c.Write([]byte(protocol.ErrConnRejected + "\r\n"))
 					c.Close()
 					return
 				}
+				if s.conn != nil {
+					s.conn.Close()
+					s.conn = nil
+				}
+				s.clientIP = clientIP
+				s.conn = c
+
+				watchdogSet := false
+				var watchdog *time.Timer
+				var watchdogDur time.Duration
 
 				reader := bufio.NewReader(c)
-				c.Write([]byte(fmt.Sprintf("500 connection info:\r\nprotocol version: 1.11\r\nmodel: %v\r\n\r\n", s.deck.Model)))
+				c.Write([]byte(fmt.Sprintf("500 connection info:\r\nprotocol version: %v\r\nmodel: %v\r\n\r\n", s.deck.GetProtocol(), s.deck.GetModel())))
 
-			conn_loop:
 				for {
 					res := "108 internal error"
 					req, err := reader.ReadString('\n')
 					if err != nil {
 						if err == io.EOF {
+							// s.Unlock()
 							continue
 						}
-						fmt.Println(fmt.Errorf("Error: %w", err))
+						log.Error().Err(err).Msg("error reading from connection")
 						c.Close()
+						s.clientIP = "" // clear the client so another can connect
+						// s.Unlock()
 						return
+					}
+
+					if watchdogSet {
+						watchdog.Reset(watchdogDur)
 					}
 
 					req = strings.TrimRight(req, "\r\n")
 					cmd := protocol.CommandFromString(req)
 
-					fmt.Printf("Request: %v\n", req)
+					log.Info().Msgf("got request: %v", req)
 					switch cmd.Name {
+					case "":
+						// empty command - ignore it
+						// s.Unlock()
+						continue
 					case "ping":
+						// Protocol level doesn't need to be processed by the deck
 						res = "200 ok"
 						break
-					case "notify":
-						// for each param, set the corresponding notifyflag
-						s.deck.Notify.Configuration = true
-
-						res = "209 ok"
-						break
-					case "transport info":
-						res = "208 transport info:\r\nstatus: stopped\r\nspeed: 0\r\nslot id: 1\r\ndisplay timecode: 00:00:00:00\r\ntimecode: 00:00:00:00\r\nclip id: 1\r\nvideo format: 720p5994\r\nloop: false\r\n"
-						break
-					case "remote":
-						res = remoteInfo(s.deck)
-						break
-					case "goto":
-						// goto: clip id: 2
-						res = "ok"
-						break
-					case "play":
-						// play: single clip: true loop: false speed: 100
-						s.deck.Transport.Status = "playing"
-						s.deck.Transport.Speed = 100
-						s.deck.Transport.Timecode = "00:00:00:01"
-						res = "ok"
-						break
-					case "clips count":
-						res = clipsCount(s.deck)
-						break
-					case "slot info":
-						slot := s.deck.Slots[s.deck.Transport.SlotID]
-						if slotID, ok := cmd.Parameters["slot id"]; ok {
-							slotID, err := strconv.ParseInt(slotID, 10, 0)
-							if err != nil {
-								fmt.Printf("Error parsing int from slot id: %v\n", err)
-								break // out to internal error
-							}
-							for _, s := range s.deck.Slots {
-								if s.ID == int(slotID) {
-									slot = s
-									break
-								}
+					case "watchdog":
+						periodStr, ok := cmd.Parameters["period"]
+						if !ok {
+							res = protocol.ErrSyntax
+							break
+						}
+						period, err := strconv.ParseInt(periodStr, 10, 0)
+						if err != nil {
+							res = protocol.ErrOutOfRange
+							break
+						}
+						if watchdogSet {
+							// Stop any previous watchdog
+							if !watchdog.Stop() {
+								<-watchdog.C
 							}
 						}
-						lines := make([]string, 0)
-						lines = append(lines, "202 slot info:")
-						lines = append(lines, slot.Marshall()...)
 
-						res = strings.Join(lines, "\r\n") + "\r\n"
-						break
-					case "clips get":
-						// HH:MM:SS:FF (NDF)
-						clips := s.deck.Clips
-						// askedForSingleClip := false
-						if clipID, ok := cmd.Parameters["clip id"]; ok {
-							clipID, err := strconv.ParseInt(clipID, 10, 0)
-							if err != nil {
-								fmt.Printf("Error parsing int from slot id: %v\n", err)
-								c.Write([]byte(protocol.ErrorInvalidValue + "\r\n"))
-								continue conn_loop
-							}
-							// askedForSingleClip = true
-							newClips := make([]Clip, 0)
-							for _, c := range s.deck.Clips {
-								if c.ID == int(clipID) {
-									newClips = append(newClips, c)
-									break
-								}
-							}
-							clips = newClips
+						watchdogDur = time.Duration(period) * time.Second
+						if period > 0 {
+							watchdog = time.AfterFunc(watchdogDur, func() {
+								log.Info().Msgf("watchdog timeout for %v", c.RemoteAddr())
+								c.Close()
+								s.clientIP = "" // clear the client so another can connect
+							})
+							watchdogSet = true
+						} else {
+							watchdogSet = false
 						}
-						// version 1: id: name startT duration
-						// version 2: id: startT duration inT outT name
-
-						lines := make([]string, 0)
-						lines = append(lines, "205 clips info:")
-						// if !askedForSingleClip {
-						lines = append(lines, fmt.Sprintf("clip count: %v", len(clips)))
-						// }
-						for _, clip := range clips {
-							lines = append(lines, fmt.Sprintf("%v: %v %v %v", clip.ID, clip.Name, clip.Start, clip.Duration))
-							// lines = append(lines, fmt.Sprintf("%v: %v %v %v %v %v", clip.ID, clip.Start, clip.Duration, clip.In, clip.Out, clip.Name))
-						}
-
-						res = strings.Join(lines, "\r\n") + "\r\n"
-						break
-					case "quit": // Shut down the connection when we get the request to do so only.
-						fmt.Printf("Told to quit... closing connection.")
+						res = "200 ok"
+					case "quit": // Shut down this connection when we get the request to do so only.
+						log.Info().Msg("told to quit; closing connection")
 						c.Close()
 						s.clientIP = "" // clear the client so another can connect
 						return
 					default:
-						res = "108 internal error"
+						res = s.deck.ProcessCommand(cmd)
 					}
 
-					fmt.Printf("Responding with: %v\n", res)
-					c.Write([]byte(res + "\r\n"))
+					log.Info().Msgf("responding with: %v", res)
+
+					toWrite := []byte(res + "\r\n")
+					s.Lock()
+					written, err := c.Write(toWrite)
+					s.Unlock()
+					if err != nil {
+						log.Error().Err(err).Msg("error writing response")
+					}
+					if written != len(toWrite) {
+						log.Error().Err(err).Msg("full response not written")
+					}
+					log.Debug().Msgf("wrote %v bytes to %v", written, s.conn.RemoteAddr().String())
+					// give our async messages a little time to grab the lock if they need it... ?
+					time.Sleep(100 * time.Millisecond)
 				}
 			}(conn)
 		}
 	}()
+}
+
+func (s *Server) AsyncSend(msg string) {
+	if s.conn != nil {
+		log.Info().Msgf(`AsyncSending "%v"`, msg)
+		s.Lock()
+		defer s.Unlock()
+		log.Info().Msg(`AsyncSend got lock`)
+		written, err := s.conn.Write([]byte(msg + "\r\n"))
+		if err != nil {
+			log.Error().Err(err).Msg("error writing async message")
+		}
+		log.Debug().Msgf("wrote %v bytes to %v", written, s.conn.RemoteAddr().String())
+	}
 }
